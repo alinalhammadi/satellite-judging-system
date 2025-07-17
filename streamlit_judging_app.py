@@ -250,12 +250,22 @@ def main():
         
         # Team navigation
         st.header("🎯 Team Navigation")
+        
+        # Get team ID from query params or default to 1
+        default_team_id = int(st.query_params.get("team", 1))
+        
         selected_team_id = st.selectbox(
             "Jump to team:",
             options=[team['id'] for team in TEAMS],
             format_func=lambda x: f"Team {x}: {next(t['name'] for t in TEAMS if t['id'] == x)}",
+            index=default_team_id - 1,
             key="team_selector"
         )
+        
+        # Update query params when selection changes
+        if selected_team_id != default_team_id:
+            st.query_params["team"] = str(selected_team_id)
+            st.rerun()
         
         # Auto-save toggle
         auto_save = st.checkbox("Auto-save progress", value=True)
@@ -370,12 +380,15 @@ def main():
         
         with col1:
             if selected_team['id'] > 1:
-                if st.button("⬅️ Previous Team"):
-                    st.session_state.team_selector = selected_team['id'] - 1
+                if st.button("⬅️ Previous Team", key="prev_team"):
+                    # Save current progress before navigating
+                    session_data['last_updated'] = datetime.now().isoformat()
+                    save_session(judge_name, session_data)
+                    st.query_params["team"] = str(selected_team['id'] - 1)
                     st.rerun()
         
         with col2:
-            if st.button("💾 Save Team"):
+            if st.button("💾 Save Team", key="save_team"):
                 session_data['last_updated'] = datetime.now().isoformat()
                 if save_session(judge_name, session_data):
                     st.success("Team evaluation saved!")
@@ -384,8 +397,11 @@ def main():
         
         with col3:
             if selected_team['id'] < len(TEAMS):
-                if st.button("Next Team ➡️"):
-                    st.session_state.team_selector = selected_team['id'] + 1
+                if st.button("Next Team ➡️", key="next_team"):
+                    # Save current progress before navigating
+                    session_data['last_updated'] = datetime.now().isoformat()
+                    save_session(judge_name, session_data)
+                    st.query_params["team"] = str(selected_team['id'] + 1)
                     st.rerun()
     
     with tab2:

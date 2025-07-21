@@ -123,22 +123,34 @@ def get_session_file(judge_name):
     safe_name = "".join(c for c in normalized_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
     return f"session_{safe_name.replace(' ', '_')}.json"
 
-def cleanup_old_sessions():
-    """Keep only the 10 most recent session files"""
+def cleanup_temp_sessions():
+    """Remove temporary/invalid session files"""
     try:
         session_files = glob.glob("session_*.json")
-        if len(session_files) > 10:
-            # Sort by modification time
-            session_files.sort(key=os.path.getmtime)
-            # Remove oldest files, keep 10 most recent
-            files_to_remove = session_files[:-10]
-            for old_file in files_to_remove:
+        for session_file in session_files:
+            # Remove files that start with Judge_YYYYMMDD (temp sessions)
+            if "Judge_2" in session_file and len(session_file.split('_')) >= 3:
                 try:
-                    os.remove(old_file)
+                    os.remove(session_file)
                 except:
-                    pass  # Ignore if file already deleted
+                    pass
     except:
-        pass  # Ignore cleanup errors
+        pass
+
+def is_valid_judge_name(name):
+    """Check if judge name is valid (not a temp ID)"""
+    if not name or name.strip() == "":
+        return False
+    
+    # Check if it's a temporary ID pattern
+    if name.startswith("Judge_") and len(name.split('_')) >= 3:
+        return False
+    
+    # Must be at least 2 characters
+    if len(name.strip()) < 2:
+        return False
+        
+    return True
 
 def get_disk_usage():
     """Get current disk usage info"""
@@ -176,8 +188,17 @@ def simple_save(judge_name, data):
         # Move temp file to final location (atomic operation)
         os.rename(temp_file, session_file)
         
-        # Cleanup old sessions after successful save
-        cleanup_old_sessions()
+        # Cleanup temp sessions and old sessions after successful save
+        cleanup_temp_sessions()
+        if len(glob.glob("session_*.json")) > 15:  # Keep 15 valid sessions max
+            session_files = glob.glob("session_*.json")
+            session_files.sort(key=os.path.getmtime)
+            files_to_remove = session_files[:-15]
+            for old_file in files_to_remove:
+                try:
+                    os.remove(old_file)
+                except:
+                    pass
         
         return True
         
@@ -271,10 +292,13 @@ def calculate_weighted_score(scores):
     return total_score
 
 def export_results():
-    """Export all results to CSV"""
+    """Export all results to CSV - only valid judges"""
     all_results = []
     
-    # Get all session files
+    # Clean up temp sessions before export
+    cleanup_temp_sessions()
+    
+    # Get all valid session files
     session_files = [f for f in os.listdir('.') if f.startswith('session_') and f.endswith('.json')]
     
     for session_file in session_files:
@@ -283,6 +307,10 @@ def export_results():
                 session_data = json.load(f)
             
             judge_name = session_data.get('judge_name', 'Unknown')
+            
+            # Skip invalid/temp judge names
+            if not is_valid_judge_name(judge_name):
+                continue
             
             for team in TEAMS:
                 team_key = f"team_{team['id']}"
@@ -325,35 +353,35 @@ def main():
     st.title("🛰️ Satellite Imagery Challenge - Judging System")
     st.markdown("---")
     
-    # Show disk usage info at top
-    disk_info = get_disk_usage()
-    if disk_info['free_mb'] > 0:
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("💾 Free Space", f"{disk_info['free_mb']} MB")
-        with col2:
-            st.metric("📁 Session Files", len(glob.glob("session_*.json")))
-        with col3:
-            if disk_info['free_mb'] < 100:
-                st.error(f"⚠️ Low disk space!")
-            else:
-                st.success("✅ Disk space OK")
-    
     # Sidebar for judge information and navigation
     with st.sidebar:
         st.header("👨‍⚖️ Judge Information")
         
-        # Judge name - MANDATORY with normalization
-        raw_judge_name = st.text_input("Judge Name*", key="judge_name", placeholder="Enter your name (required)")
+        # Judge name - MANDATORY with strict validation
+        raw_judge_name = st.text_input("Judge Name*", key="judge_name", placeholder="Enter your full name (required)")
         
-        if not raw_judge_name or raw_judge_name.strip() == "":
-            st.error("⚠️ Judge name is required to continue")
+        # Strict validation - no proceeding without valid name
+        if not is_valid_judge_name(raw_judge_name):
+            if raw_judge_name and raw_judge_name.strip() != "":
+                if raw_judge_name.startswith("Judge_"):
+                    st.error("⚠️ Please enter your actual name, not a temporary ID")
+                elif len(raw_judge_name.strip()) < 2:
+                    st.error("⚠️ Please enter your full name (minimum 2 characters)")
+                else:
+                    st.error("⚠️ Invalid name format")
+            else:
+                st.error("⚠️ Judge name is required to continue")
+            
+            st.warning("👆 Please enter your name above to start judging")
             st.stop()
         
         # Normalize judge name (Title Case)
         judge_name = normalize_judge_name(raw_judge_name)
         if judge_name != raw_judge_name:
             st.info(f"Name normalized to: {judge_name}")
+        
+        # Clean up any temp sessions on startup
+        cleanup_temp_sessions()
         
         # Load existing session
         session_data = simple_load(judge_name)
@@ -429,20 +457,37 @@ def main():
             else:
                 st.error("❌ Save failed - check disk space")
         
-        # Export results (admin only)
-        st.header("📤 Export Results")
-        if st.button("Export All Results"):
-            filename, df = export_results()
-            if filename:
-                st.success(f"Results exported to {filename}")
-                st.download_button(
-                    label="Download Results",
-                    data=df.to_csv(index=False),
-                    file_name=filename,
-                    mime="text/csv"
-                )
-            else:
-                st.warning("No results to export")
+        # Export results (admin only - hidden section)
+        if st.button("🔧 Admin Panel", help="System admin access"):
+            st.header("📊 System Status")
+            
+            # Show disk usage (admin only)
+            disk_info = get_disk_usage()
+            if disk_info['free_mb'] > 0:
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("💾 Free Space", f"{disk_info['free_mb']} MB")
+                with col2:
+                    st.metric("📁 Session Files", len(glob.glob("session_*.json")))
+                with col3:
+                    if disk_info['free_mb'] < 100:
+                        st.error(f"⚠️ Low disk space!")
+                    else:
+                        st.success("✅ Disk space OK")
+            
+            st.header("📤 Export Results")
+            if st.button("Export All Results"):
+                filename, df = export_results()
+                if filename:
+                    st.success(f"Results exported to {filename}")
+                    st.download_button(
+                        label="Download Results",
+                        data=df.to_csv(index=False),
+                        file_name=filename,
+                        mime="text/csv"
+                    )
+                else:
+                    st.warning("No results to export")
     
     # Main content area
     selected_team = next(team for team in TEAMS if team['id'] == selected_team_id)

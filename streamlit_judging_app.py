@@ -3,6 +3,7 @@ import pandas as pd
 import sqlite3
 from datetime import datetime
 import json
+import time
 
 # Page configuration
 st.set_page_config(
@@ -479,8 +480,7 @@ def main():
         if changes_made:
             if save_evaluation(judge_name, selected_team['id'], selected_team['name'], updated_scores, comment):
                 st.success("✅ Changes saved automatically!")
-                # Reload the page to reflect changes
-                time.sleep(0.5)
+                # Brief pause then reload to reflect changes
                 st.rerun()
         
         # Navigation buttons

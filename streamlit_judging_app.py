@@ -475,19 +475,102 @@ def main():
                     else:
                         st.success("✅ Disk space OK")
             
-            st.header("📤 Export Results")
-            if st.button("Export All Results"):
-                filename, df = export_results()
-                if filename:
-                    st.success(f"Results exported to {filename}")
-                    st.download_button(
-                        label="Download Results",
-                        data=df.to_csv(index=False),
-                        file_name=filename,
-                        mime="text/csv"
-                    )
+            st.header("📤 Export & Backup")
+            
+            # Show current session info first
+            session_files = glob.glob("session_*.json")
+            valid_sessions = 0
+            total_evaluations = 0
+            
+            for session_file in session_files:
+                try:
+                    with open(session_file, 'r') as f:
+                        session_data = json.load(f)
+                    judge_name = session_data.get('judge_name', 'Unknown')
+                    if is_valid_judge_name(judge_name):
+                        valid_sessions += 1
+                        # Count team evaluations
+                        for team in TEAMS:
+                            team_key = f"team_{team['id']}"
+                            if team_key in session_data:
+                                total_evaluations += 1
+                except:
+                    continue
+            
+            st.info(f"Found {valid_sessions} valid judges with {total_evaluations} team evaluations")
+            
+            # CSV Export
+            st.subheader("📊 CSV Export")
+            if st.button("Export Results as CSV"):
+                if total_evaluations == 0:
+                    st.warning("No evaluations found to export!")
                 else:
-                    st.warning("No results to export")
+                    with st.spinner("Preparing export..."):
+                        filename, df = export_results()
+                        if filename and df is not None:
+                            st.success(f"✅ Results exported! ({len(df)} rows)")
+                            
+                            # Show preview
+                            st.subheader("Preview (first 10 rows):")
+                            st.dataframe(df.head(10))
+                            
+                            # Download button
+                            csv_data = df.to_csv(index=False).encode('utf-8')
+                            st.download_button(
+                                label="📥 Download CSV File",
+                                data=csv_data,
+                                file_name=f"judging_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                mime="text/csv",
+                                type="primary"
+                            )
+                            
+                            st.info("👆 Click the download button above to save the CSV file to your computer")
+                        else:
+                            st.error("❌ Export failed - no valid data found")
+            
+            # JSON Backup
+            st.subheader("💾 Full Data Backup")
+            if st.button("Create Complete Backup"):
+                with st.spinner("Creating backup..."):
+                    backup_file, sessions = backup_to_github()
+                    if backup_file:
+                        st.success(f"✅ Backup created with {len(sessions)} judges")
+                        
+                        # Create downloadable backup
+                        backup_data = json.dumps(sessions, indent=2).encode('utf-8')
+                        st.download_button(
+                            label="📥 Download Full Backup (JSON)",
+                            data=backup_data,
+                            file_name=f"complete_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                            mime="application/json",
+                            type="secondary"
+                        )
+                        
+                        st.warning("⚠️ IMPORTANT: Save this backup file! Container data may be lost on restart.")
+                    else:
+                        st.error(f"❌ Backup failed: {sessions}")
+            
+            # Progress Log
+            st.subheader("📋 Progress Summary")
+            if st.button("Show Current Progress"):
+                progress = save_progress_log()
+                if progress:
+                    st.json(progress)
+                    
+                    # Download progress log
+                    progress_data = json.dumps(progress, indent=2).encode('utf-8')
+                    st.download_button(
+                        label="📥 Download Progress Log",
+                        data=progress_data,
+                        file_name=f"progress_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                        mime="application/json"
+                    )
+            
+            # Cleanup button
+            if st.button("🧹 Clean Temp Files"):
+                cleanup_temp_sessions()
+                st.success("Temporary files cleaned!")
+                st.rerun()
     
     # Main content area
     selected_team = next(team for team in TEAMS if team['id'] == selected_team_id)

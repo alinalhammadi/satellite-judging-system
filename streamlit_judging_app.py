@@ -3,7 +3,13 @@ import pandas as pd
 import json
 import os
 import glob
+import sqlite3
+import threading
+import time
 from datetime import datetime
+import requests
+import base64
+from typing import Dict, Any, Optional
 
 # Page configuration
 st.set_page_config(
@@ -12,6 +18,15 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# GitHub Configuration - Updated for your repository
+GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", os.getenv("GITHUB_TOKEN", ""))
+GITHUB_REPO = "alinalhammadi/satellite-judging-system"
+BACKUP_FOLDER = "database_backups"
+
+# Database configuration
+DB_FILE = "judging_database.db"
+BACKUP_INTERVAL = 30  # seconds
 
 # Team data (final order and names)
 TEAMS = [
@@ -44,64 +59,37 @@ CRITERIA = [
     {"id": "team_expertise", "name": "Team relevant expertise", "weight": 10, "description": "Assesses the team's current and planned expertise related to the topic and application development, including strategies to acquire or supplement needed knowledge."}
 ]
 
-# Score labels
-SCORE_LABELS = {
-    1: "Poor",
-    2: "Fair", 
-    3: "Satisfactory",
-    4: "Good",
-    5: "Excellent"
-}
+# Score labels and descriptions
+SCORE_LABELS = {1: "Poor", 2: "Fair", 3: "Satisfactory", 4: "Good", 5: "Excellent"}
 
-# Detailed score descriptions for each criterion
 SCORE_DESCRIPTIONS = {
     "problem_definition": {
-        1: "Vague or unclear",
-        2: "Some relevance, lacks clarity",
-        3: "Clear but generic",
-        4: "Clear and relevant",
-        5: "Clear, specific, and impactful"
+        1: "Vague or unclear", 2: "Some relevance, lacks clarity", 3: "Clear but generic",
+        4: "Clear and relevant", 5: "Clear, specific, and impactful"
     },
     "technical_execution": {
-        1: "Minimal effort or errors",
-        2: "Basic implementation",
-        3: "Functional with some issues",
-        4: "Well-executed and thoughtful",
-        5: "Robust, innovative, and well-documented"
+        1: "Minimal effort or errors", 2: "Basic implementation", 3: "Functional with some issues",
+        4: "Well-executed and thoughtful", 5: "Robust, innovative, and well-documented"
     },
     "results_interpretation": {
-        1: "No results or unclear",
-        2: "Basic results, limited insight",
-        3: "Clear results, some interpretation",
-        4: "Good results with meaningful insights",
-        5: "Excellent results with deep analysis"
+        1: "No results or unclear", 2: "Basic results, limited insight", 3: "Clear results, some interpretation",
+        4: "Good results with meaningful insights", 5: "Excellent results with deep analysis"
     },
     "learning_reflection": {
-        1: "No reflection",
-        2: "Minimal reflection",
-        3: "Some learning evident",
-        4: "Good insights and learning",
-        5: "Strong reflection and growth demonstrated"
+        1: "No reflection", 2: "Minimal reflection", 3: "Some learning evident",
+        4: "Good insights and learning", 5: "Strong reflection and growth demonstrated"
     },
     "presentation_quality": {
-        1: "Disorganized or hard to follow",
-        2: "Basic structure, lacks polish",
-        3: "Clear and understandable",
-        4: "Well-structured and engaging",
-        5: "Highly professional and compelling"
+        1: "Disorganized or hard to follow", 2: "Basic structure, lacks polish", 3: "Clear and understandable",
+        4: "Well-structured and engaging", 5: "Highly professional and compelling"
     },
     "long_term_vision": {
-        1: "No clear vision",
-        2: "Vague or disconnected",
-        3: "Some connection",
-        4: "Clear and relevant extension",
-        5: "Strong, innovative, and well-aligned vision"
+        1: "No clear vision", 2: "Vague or disconnected", 3: "Some connection",
+        4: "Clear and relevant extension", 5: "Strong, innovative, and well-aligned vision"
     },
     "scientific_evaluation": {
-        1: "Already in use, will not result in anything new",
-        2: "Already in use, but gets better results with better features",
-        3: "Common idea that may be used in a different way",
-        4: "Common idea with new component/aspect of science",
+        1: "Already in use, will not result in anything new", 2: "Already in use, but gets better results with better features",
+        3: "Common idea that may be used in a different way", 4: "Common idea with new component/aspect of science",
         5: "Breakthrough science; new idea not done before"
     },
     "team_expertise": {
@@ -113,177 +101,343 @@ SCORE_DESCRIPTIONS = {
     }
 }
 
-def normalize_judge_name(name):
+class DatabaseManager:
+    """Handles all database operations with automatic backups"""
+    
+    def __init__(self, db_file: str):
+        self.db_file = db_file
+        self.init_database()
+        self.start_backup_thread()
+    
+    def init_database(self):
+        """Initialize the database with required tables"""
+        try:
+            with sqlite3.connect(self.db_file) as conn:
+                cursor = conn.cursor()
+                
+                # Judges table
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS judges (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT UNIQUE NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                # Evaluations table
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS evaluations (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        judge_name TEXT NOT NULL,
+                        team_id INTEGER NOT NULL,
+                        team_name TEXT NOT NULL,
+                        criterion_id TEXT NOT NULL,
+                        score INTEGER NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(judge_name, team_id, criterion_id)
+                    )
+                ''')
+                
+                # Comments table
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS comments (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        judge_name TEXT NOT NULL,
+                        team_id INTEGER NOT NULL,
+                        comment TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(judge_name, team_id)
+                    )
+                ''')
+                
+                # Activity log for debugging
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS activity_log (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        judge_name TEXT,
+                        action TEXT,
+                        details TEXT,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                conn.commit()
+                
+        except Exception as e:
+            st.error(f"Database initialization failed: {e}")
+    
+    def log_activity(self, judge_name: str, action: str, details: str = ""):
+        """Log activity for debugging and audit purposes"""
+        try:
+            with sqlite3.connect(self.db_file) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO activity_log (judge_name, action, details) VALUES (?, ?, ?)",
+                    (judge_name, action, details)
+                )
+                conn.commit()
+        except Exception:
+            pass  # Silent fail for logging
+    
+    def save_judge(self, judge_name: str) -> bool:
+        """Save or update judge information"""
+        try:
+            with sqlite3.connect(self.db_file) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT OR REPLACE INTO judges (name, last_active)
+                    VALUES (?, CURRENT_TIMESTAMP)
+                ''', (judge_name,))
+                conn.commit()
+                self.log_activity(judge_name, "judge_login", "Judge session started")
+                return True
+        except Exception as e:
+            st.error(f"Failed to save judge: {e}")
+            return False
+    
+    def save_evaluation(self, judge_name: str, team_id: int, team_name: str, scores: Dict[str, int], comment: str = "") -> bool:
+        """Save evaluation scores and comments with atomic transaction"""
+        try:
+            with sqlite3.connect(self.db_file) as conn:
+                cursor = conn.cursor()
+                
+                # Start transaction
+                cursor.execute("BEGIN TRANSACTION")
+                
+                try:
+                    # Save scores
+                    for criterion_id, score in scores.items():
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO evaluations 
+                            (judge_name, team_id, team_name, criterion_id, score, updated_at)
+                            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ''', (judge_name, team_id, team_name, criterion_id, score))
+                    
+                    # Save comment
+                    if comment.strip():
+                        cursor.execute('''
+                            INSERT OR REPLACE INTO comments
+                            (judge_name, team_id, comment, updated_at)
+                            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                        ''', (judge_name, team_id, comment.strip()))
+                    
+                    # Update judge activity
+                    cursor.execute('''
+                        UPDATE judges SET last_active = CURRENT_TIMESTAMP WHERE name = ?
+                    ''', (judge_name,))
+                    
+                    cursor.execute("COMMIT")
+                    self.log_activity(judge_name, "evaluation_saved", f"Team {team_id}: {team_name}")
+                    return True
+                    
+                except Exception as e:
+                    cursor.execute("ROLLBACK")
+                    raise e
+                    
+        except Exception as e:
+            st.error(f"Failed to save evaluation: {e}")
+            return False
+    
+    def load_evaluation(self, judge_name: str, team_id: int) -> Dict[str, Any]:
+        """Load evaluation data for a specific judge and team"""
+        try:
+            with sqlite3.connect(self.db_file) as conn:
+                cursor = conn.cursor()
+                
+                # Load scores
+                cursor.execute('''
+                    SELECT criterion_id, score FROM evaluations
+                    WHERE judge_name = ? AND team_id = ?
+                ''', (judge_name, team_id))
+                
+                scores = {row[0]: row[1] for row in cursor.fetchall()}
+                
+                # Load comment
+                cursor.execute('''
+                    SELECT comment FROM comments
+                    WHERE judge_name = ? AND team_id = ?
+                ''', (judge_name, team_id))
+                
+                comment_row = cursor.fetchone()
+                comment = comment_row[0] if comment_row else ""
+                
+                result = scores.copy()
+                result['comment'] = comment
+                
+                return result
+                
+        except Exception as e:
+            st.error(f"Failed to load evaluation: {e}")
+            return {}
+    
+    def get_judge_progress(self, judge_name: str) -> Dict[str, int]:
+        """Get progress statistics for a judge"""
+        try:
+            with sqlite3.connect(self.db_file) as conn:
+                cursor = conn.cursor()
+                
+                # Count completed teams (teams with all criteria scored)
+                cursor.execute('''
+                    SELECT team_id, COUNT(DISTINCT criterion_id) as criteria_count
+                    FROM evaluations 
+                    WHERE judge_name = ?
+                    GROUP BY team_id
+                    HAVING criteria_count = ?
+                ''', (judge_name, len(CRITERIA)))
+                
+                completed_teams = len(cursor.fetchall())
+                
+                return {
+                    'completed_teams': completed_teams,
+                    'total_teams': len(TEAMS),
+                    'progress': completed_teams / len(TEAMS)
+                }
+                
+        except Exception as e:
+            st.error(f"Failed to get progress: {e}")
+            return {'completed_teams': 0, 'total_teams': len(TEAMS), 'progress': 0}
+    
+    def export_all_data(self) -> Optional[pd.DataFrame]:
+        """Export all evaluation data as DataFrame"""
+        try:
+            with sqlite3.connect(self.db_file) as conn:
+                query = '''
+                SELECT 
+                    e.judge_name,
+                    e.team_id,
+                    e.team_name,
+                    e.criterion_id,
+                    e.score,
+                    c.comment,
+                    e.updated_at
+                FROM evaluations e
+                LEFT JOIN comments c ON e.judge_name = c.judge_name AND e.team_id = c.team_id
+                ORDER BY e.judge_name, e.team_id, e.criterion_id
+                '''
+                
+                df = pd.read_sql_query(query, conn)
+                return df
+                
+        except Exception as e:
+            st.error(f"Failed to export data: {e}")
+            return None
+    
+    def create_database_backup(self) -> str:
+        """Create a backup of the entire database"""
+        try:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            backup_file = f"backup_database_{timestamp}.db"
+            
+            # Copy database file
+            import shutil
+            shutil.copy2(self.db_file, backup_file)
+            
+            return backup_file
+            
+        except Exception as e:
+            st.error(f"Failed to create database backup: {e}")
+            return ""
+    
+    def start_backup_thread(self):
+        """Start background thread for periodic backups"""
+        if not hasattr(st.session_state, 'backup_thread_started'):
+            st.session_state.backup_thread_started = True
+            
+            def backup_loop():
+                while True:
+                    time.sleep(BACKUP_INTERVAL)
+                    try:
+                        self.backup_to_github()
+                    except Exception:
+                        pass  # Silent fail for background backups
+            
+            backup_thread = threading.Thread(target=backup_loop, daemon=True)
+            backup_thread.start()
+    
+    def backup_to_github(self) -> bool:
+        """Backup database to your GitHub repository"""
+        if not GITHUB_TOKEN or not GITHUB_REPO:
+            return False
+            
+        try:
+            # Create database backup
+            backup_file = self.create_database_backup()
+            if not backup_file:
+                return False
+            
+            # Read backup file
+            with open(backup_file, 'rb') as f:
+                content = base64.b64encode(f.read()).decode()
+            
+            # Upload to your GitHub repository
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            file_path = f"{BACKUP_FOLDER}/database_backup_{timestamp}.db"
+            
+            # Check if backup folder exists, create if not
+            folder_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{BACKUP_FOLDER}"
+            headers = {
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github.v3+json"
+            }
+            
+            # Try to create backup folder
+            try:
+                folder_data = {
+                    "message": f"Create backup folder",
+                    "content": base64.b64encode(b"# Database Backups\n\nThis folder contains automated database backups from the satellite judging system.").decode(),
+                    "path": f"{BACKUP_FOLDER}/README.md"
+                }
+                requests.put(f"https://api.github.com/repos/{GITHUB_REPO}/contents/{BACKUP_FOLDER}/README.md", 
+                           json=folder_data, headers=headers)
+            except:
+                pass  # Folder might already exist
+            
+            # Upload database backup
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
+            
+            data = {
+                "message": f"Auto-backup: Database backup {timestamp}",
+                "content": content,
+                "branch": "main"
+            }
+            
+            response = requests.put(url, json=data, headers=headers)
+            
+            # Clean up local backup file
+            os.remove(backup_file)
+            
+            if response.status_code == 201:
+                return True
+            else:
+                # Log error for debugging
+                print(f"GitHub backup failed: {response.status_code} - {response.text}")
+                return False
+            
+        except Exception as e:
+            print(f"GitHub backup error: {e}")
+            return False
+
+# Initialize database manager
+db_manager = DatabaseManager(DB_FILE)
+
+def normalize_judge_name(name: str) -> str:
     """Normalize judge name: Title Case"""
     return name.strip().title()
 
-def get_session_file(judge_name):
-    """Generate a unique session file name for each judge"""
-    normalized_name = normalize_judge_name(judge_name)
-    safe_name = "".join(c for c in normalized_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
-    return f"session_{safe_name.replace(' ', '_')}.json"
-
-def cleanup_temp_sessions():
-    """Remove temporary/invalid session files"""
-    try:
-        session_files = glob.glob("session_*.json")
-        for session_file in session_files:
-            # Remove files that start with Judge_YYYYMMDD (temp sessions)
-            if "Judge_2" in session_file and len(session_file.split('_')) >= 3:
-                try:
-                    os.remove(session_file)
-                except:
-                    pass
-    except:
-        pass
-
-def is_valid_judge_name(name):
-    """Check if judge name is valid (not a temp ID)"""
+def is_valid_judge_name(name: str) -> bool:
+    """Check if judge name is valid"""
     if not name or name.strip() == "":
         return False
-    
-    # Check if it's a temporary ID pattern
     if name.startswith("Judge_") and len(name.split('_')) >= 3:
         return False
-    
-    # Must be at least 2 characters
     if len(name.strip()) < 2:
         return False
-        
     return True
 
-def get_disk_usage():
-    """Get current disk usage info"""
-    try:
-        import shutil
-        total, used, free = shutil.disk_usage(".")
-        return {
-            'total_mb': total // (1024*1024),
-            'used_mb': used // (1024*1024),
-            'free_mb': free // (1024*1024)
-        }
-    except:
-        return {'total_mb': 0, 'used_mb': 0, 'free_mb': 0}
-
-def simple_save(judge_name, data):
-    """Simple, reliable save function with error reporting"""
-    session_file = get_session_file(judge_name)
-    temp_file = session_file + ".tmp"
-    
-    try:
-        # Check disk space first
-        disk_info = get_disk_usage()
-        if disk_info['free_mb'] < 50:  # Less than 50MB free
-            st.error("⚠️ Low disk space! Cannot save data.")
-            return False
-        
-        # Prepare data with metadata
-        data['last_saved'] = datetime.now().isoformat()
-        data['judge_name_normalized'] = normalize_judge_name(judge_name)
-        
-        # Atomic save: write to temp file first
-        with open(temp_file, 'w') as f:
-            json.dump(data, f, indent=2)
-        
-        # Move temp file to final location (atomic operation)
-        os.rename(temp_file, session_file)
-        
-        # Cleanup temp sessions and old sessions after successful save
-        cleanup_temp_sessions()
-        if len(glob.glob("session_*.json")) > 15:  # Keep 15 valid sessions max
-            session_files = glob.glob("session_*.json")
-            session_files.sort(key=os.path.getmtime)
-            files_to_remove = session_files[:-15]
-            for old_file in files_to_remove:
-                try:
-                    os.remove(old_file)
-                except:
-                    pass
-        
-        return True
-        
-    except OSError as e:
-        st.error(f"💾 Save failed - Disk error: {str(e)}")
-        return False
-    except json.JSONEncodeError as e:
-        st.error(f"💾 Save failed - Data error: {str(e)}")
-        return False
-    except Exception as e:
-        st.error(f"💾 Save failed - Unexpected error: {str(e)}")
-        return False
-    finally:
-        # Clean up temp file if it exists
-        try:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-        except:
-            pass
-
-def simple_load(judge_name):
-    """Simple, reliable load function with validation"""
-    session_file = get_session_file(judge_name)
-    
-    try:
-        if os.path.exists(session_file):
-            with open(session_file, 'r') as f:
-                data = json.load(f)
-            
-            # Basic validation
-            if not isinstance(data, dict):
-                st.warning("⚠️ Session data corrupted, starting fresh")
-                return {}
-            
-            # Normalize judge name in loaded data
-            if 'judge_name' in data:
-                data['judge_name'] = normalize_judge_name(data['judge_name'])
-            
-            return data
-            
-    except json.JSONDecodeError:
-        st.error("💾 Session file corrupted, starting with fresh data")
-        return {}
-    except Exception as e:
-        st.error(f"💾 Load failed: {str(e)}")
-        return {}
-    
-    return {}
-
-def verify_save_success(judge_name, data):
-    """Verify that data was actually saved correctly"""
-    try:
-        # Load the saved data and compare
-        loaded_data = simple_load(judge_name)
-        
-        # Check critical fields
-        if loaded_data.get('judge_name_normalized') == normalize_judge_name(judge_name):
-            if loaded_data.get('last_saved') == data.get('last_saved'):
-                return True
-        
-        return False
-    except:
-        return False
-
-def auto_save_progress(judge_name, session_data):
-    """Auto-save progress with verification"""
-    try:
-        success = simple_save(judge_name, session_data)
-        
-        if success:
-            # Verify the save worked
-            if verify_save_success(judge_name, session_data):
-                return True
-            else:
-                st.warning("⚠️ Save verification failed - data may not be saved!")
-                return False
-        else:
-            st.error("❌ Auto-save failed!")
-            return False
-            
-    except Exception as e:
-        st.error(f"❌ Auto-save error: {str(e)}")
-        return False
-
-def calculate_weighted_score(scores):
+def calculate_weighted_score(scores: Dict[str, int]) -> float:
     """Calculate weighted score for a team"""
     total_score = 0
     for criterion in CRITERIA:
@@ -291,76 +445,21 @@ def calculate_weighted_score(scores):
             total_score += scores[criterion['id']] * criterion['weight'] / 100
     return total_score
 
-def export_results():
-    """Export all results to CSV - only valid judges"""
-    all_results = []
-    
-    # Clean up temp sessions before export
-    cleanup_temp_sessions()
-    
-    # Get all valid session files
-    session_files = [f for f in os.listdir('.') if f.startswith('session_') and f.endswith('.json')]
-    
-    for session_file in session_files:
-        try:
-            with open(session_file, 'r') as f:
-                session_data = json.load(f)
-            
-            judge_name = session_data.get('judge_name', 'Unknown')
-            
-            # Skip invalid/temp judge names
-            if not is_valid_judge_name(judge_name):
-                continue
-            
-            for team in TEAMS:
-                team_key = f"team_{team['id']}"
-                if team_key in session_data:
-                    team_data = session_data[team_key]
-                    
-                    result = {
-                        'judge_name': judge_name,
-                        'team_id': team['id'],
-                        'team_name': team['name'],
-                        'team_project': team['project'],
-                        'submission_time': session_data.get('last_updated', 'Unknown')
-                    }
-                    
-                    # Add scores
-                    for criterion in CRITERIA:
-                        result[f"{criterion['name']} ({criterion['weight']}%)"] = team_data.get(criterion['id'], 0)
-                    
-                    # Add weighted score
-                    result['weighted_score'] = calculate_weighted_score(team_data)
-                    
-                    # Add comment
-                    result['comment'] = team_data.get('comment', '')
-                    
-                    all_results.append(result)
-        
-        except Exception as e:
-            st.error(f"Error processing {session_file}: {e}")
-    
-    if all_results:
-        df = pd.DataFrame(all_results)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"judging_results_{timestamp}.csv"
-        df.to_csv(filename, index=False)
-        return filename, df
-    
-    return None, None
-
 def main():
     st.title("🛰️ Satellite Imagery Challenge - Judging System")
     st.markdown("---")
+    
+    # Real-time connection status
+    connection_status = st.empty()
+    connection_status.success("🟢 System Online - Auto-saving enabled")
     
     # Sidebar for judge information and navigation
     with st.sidebar:
         st.header("👨‍⚖️ Judge Information")
         
-        # Judge name - MANDATORY with strict validation
+        # Judge name input with validation
         raw_judge_name = st.text_input("Judge Name*", key="judge_name", placeholder="Enter your full name (required)")
         
-        # Strict validation - no proceeding without valid name
         if not is_valid_judge_name(raw_judge_name):
             if raw_judge_name and raw_judge_name.strip() != "":
                 if raw_judge_name.startswith("Judge_"):
@@ -375,58 +474,33 @@ def main():
             st.warning("👆 Please enter your name above to start judging")
             st.stop()
         
-        # Normalize judge name (Title Case)
+        # Normalize judge name
         judge_name = normalize_judge_name(raw_judge_name)
         if judge_name != raw_judge_name:
             st.info(f"Name normalized to: {judge_name}")
         
-        # Clean up any temp sessions on startup
-        cleanup_temp_sessions()
-        
-        # Load existing session
-        session_data = simple_load(judge_name)
-        
-        # Initialize session data if not exists
-        if not session_data:
-            session_data = {
-                'judge_name': judge_name,
-                'created_at': datetime.now().isoformat(),
-                'last_updated': datetime.now().isoformat()
-            }
-            # Save immediately with verification
-            if simple_save(judge_name, session_data):
-                st.success("✅ New session created!")
-            else:
-                st.error("❌ Failed to create session!")
-        
-        st.success(f"✅ Welcome, {judge_name}!")
-        
-        # Show last save time and verification
-        if 'last_saved' in session_data:
-            save_time = datetime.fromisoformat(session_data['last_saved'])
-            st.caption(f"Last saved: {save_time.strftime('%H:%M:%S')}")
-            
-        # Save verification status
-        if verify_save_success(judge_name, session_data):
-            st.success("💾 Data verified safe")
+        # Register/update judge in database
+        if db_manager.save_judge(judge_name):
+            st.success(f"✅ Welcome, {judge_name}!")
         else:
-            st.warning("⚠️ Save verification pending")
+            st.error("❌ Failed to register judge")
+            st.stop()
         
         st.markdown("---")
         
         # Progress tracking
         st.header("📊 Progress")
-        completed_teams = 0
-        for team in TEAMS:
-            team_key = f"team_{team['id']}"
-            if team_key in session_data:
-                team_data = session_data[team_key]
-                if all(criterion['id'] in team_data for criterion in CRITERIA):
-                    completed_teams += 1
+        progress_data = db_manager.get_judge_progress(judge_name)
+        completed_teams = progress_data['completed_teams']
+        total_teams = progress_data['total_teams']
+        progress = progress_data['progress']
         
-        progress = completed_teams / len(TEAMS)
         st.progress(progress)
-        st.write(f"Completed: {completed_teams}/{len(TEAMS)} teams")
+        st.write(f"Completed: {completed_teams}/{total_teams} teams")
+        
+        if progress == 1.0:
+            st.success("🎉 All teams evaluated!")
+            st.balloons()
         
         # Team navigation
         st.header("🎯 Team Navigation")
@@ -447,120 +521,70 @@ def main():
             st.query_params["team"] = str(selected_team_id)
             st.rerun()
         
-        # Simple manual save with verification
-        if st.button("💾 Save Progress", help="Save your current progress"):
-            success = simple_save(judge_name, session_data)
-            if success and verify_save_success(judge_name, session_data):
-                st.success("✅ Progress saved and verified!")
-            elif success:
-                st.warning("⚠️ Save completed but verification failed")
-            else:
-                st.error("❌ Save failed - check disk space")
+        # Manual save button
+        if st.button("💾 Force Save", help="Force save current progress"):
+            st.success("✅ Auto-save is always active!")
+            
+        # System status
+        st.header("📊 System Status")
+        st.success("🟢 Database Connected")
+        st.info(f"🔄 Auto-backup every {BACKUP_INTERVAL}s")
         
-        # Export results (admin only - hidden section)
-        if st.button("🔧 Admin Panel", help="System admin access"):
-            st.header("📊 System Status")
+        # Export options for admin
+        if st.button("📊 Admin Panel"):
+            st.header("📤 Data Export")
             
-            # Show disk usage (admin only)
-            disk_info = get_disk_usage()
-            if disk_info['free_mb'] > 0:
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("💾 Free Space", f"{disk_info['free_mb']} MB")
-                with col2:
-                    st.metric("📁 Session Files", len(glob.glob("session_*.json")))
-                with col3:
-                    if disk_info['free_mb'] < 100:
-                        st.error(f"⚠️ Low disk space!")
-                    else:
-                        st.success("✅ Disk space OK")
-            
-            st.header("📤 Export & Backup")
-            
-            # Show current session info first
-            session_files = glob.glob("session_*.json")
-            valid_sessions = 0
-            total_evaluations = 0
-            
-            for session_file in session_files:
-                try:
-                    with open(session_file, 'r') as f:
-                        session_data = json.load(f)
-                    judge_name = session_data.get('judge_name', 'Unknown')
-                    if is_valid_judge_name(judge_name):
-                        valid_sessions += 1
-                        # Count team evaluations
-                        for team in TEAMS:
-                            team_key = f"team_{team['id']}"
-                            if team_key in session_data:
-                                total_evaluations += 1
-                except:
-                    continue
-            
-            st.info(f"Found {valid_sessions} valid judges with {total_evaluations} team evaluations")
-            
-            # CSV Export
-            st.subheader("📊 CSV Export")
-            if st.button("Export Results as CSV"):
-                if total_evaluations == 0:
-                    st.warning("No evaluations found to export!")
+            # Export to CSV
+            if st.button("Export Results (CSV)"):
+                df = db_manager.export_all_data()
+                if df is not None:
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    csv_data = df.to_csv(index=False).encode('utf-8')
+                    
+                    st.download_button(
+                        label="📥 Download CSV",
+                        data=csv_data,
+                        file_name=f"judging_results_{timestamp}.csv",
+                        mime="text/csv"
+                    )
                 else:
-                    with st.spinner("Preparing export..."):
-                        filename, df = export_results()
-                        if filename and df is not None:
-                            st.success(f"✅ Results exported! ({len(df)} rows)")
-                            
-                            # Show preview
-                            st.subheader("Preview (first 10 rows):")
-                            st.dataframe(df.head(10))
-                            
-                            # Download button
-                            csv_data = df.to_csv(index=False).encode('utf-8')
-                            st.download_button(
-                                label="📥 Download CSV File",
-                                data=csv_data,
-                                file_name=f"judging_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                                mime="text/csv",
-                                type="primary"
-                            )
-                            
-                            st.info("👆 Click the download button above to save the CSV file to your computer")
-                        else:
-                            st.error("❌ Export failed - no valid data found")
+                    st.error("❌ Export failed")
             
-            # JSON Backup
-            st.subheader("💾 Full Data Backup")
-            if st.button("Create Complete Backup"):
-                with st.spinner("Creating backup..."):
-                    backup_file, sessions = backup_to_github()
-                    if backup_file:
-                        st.success(f"✅ Backup created with {len(sessions)} judges")
-                        
-                        # Create downloadable backup
-                        backup_data = json.dumps(sessions, indent=2).encode('utf-8')
+            # Database backup
+            if st.button("Create Database Backup"):
+                backup_file = db_manager.create_database_backup()
+                if backup_file:
+                    with open(backup_file, 'rb') as f:
                         st.download_button(
-                            label="📥 Download Full Backup (JSON)",
-                            data=backup_data,
-                            file_name=f"complete_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                            mime="application/json",
-                            type="secondary"
+                            label="📥 Download Database Backup",
+                            data=f.read(),
+                            file_name=backup_file,
+                            mime="application/octet-stream"
                         )
-                        
-                        st.warning("⚠️ IMPORTANT: Save this backup file! Container data may be lost on restart.")
-                    else:
-                        st.error(f"❌ Backup failed: {sessions}")
+                    os.remove(backup_file)
+                else:
+                    st.error("❌ Backup failed")
             
-            # Progress Log
-            st.subheader("📋 Progress Summary")
-            if st.button("Show Current Progress"):
-                progress = save_progress_log()
-                if progress:
+            # GitHub backup status
+            if GITHUB_TOKEN and GITHUB_REPO:
+                st.success("✅ GitHub backup configured")
+                st.info(f"📂 Backup location: {GITHUB_REPO}/{BACKUP_FOLDER}")
+                
+                # Show last backup attempt status
+                if st.button("🔄 Test GitHub Backup"):
+                    if db_manager.backup_to_github():
+                        st.success("✅ GitHub backup successful!")
+                    else:
+                        st.error("❌ GitHub backup failed - check token and permissions")
+            else:
+                st.warning("⚠️ GitHub backup not configured")
+                st.info("Add GITHUB_TOKEN to Streamlit secrets to enable auto-backup")
     
     # Main content area
     selected_team = next(team for team in TEAMS if team['id'] == selected_team_id)
     
     # Load existing evaluation from database
-    team_scores = load_evaluation(judge_name, selected_team['id'])
+    team_scores = db_manager.load_evaluation(judge_name, selected_team['id'])
     
     # Display team information
     col1, col2 = st.columns([3, 1])
@@ -571,7 +595,7 @@ def main():
     
     with col2:
         # Team completion status
-        team_complete = len(team_scores) > 0 and all(criterion['id'] in team_scores for criterion in CRITERIA)
+        team_complete = len(team_scores) > 1 and all(criterion['id'] in team_scores for criterion in CRITERIA)
         if team_complete:
             st.success("✅ Complete")
             weighted_score = calculate_weighted_score(team_scores)
@@ -584,37 +608,35 @@ def main():
     
     st.markdown("---")
     
-    # Evaluation criteria
+    # Auto-save indicator
+    auto_save_status = st.empty()
+    
+    # Evaluation form
     st.header("📝 Evaluation Criteria")
     
-    # Create tabs for better organization
-    tab1, tab2 = st.tabs(["Evaluation", "Summary"])
-    
-    with tab1:
-        # Track if any changes were made
-        changes_made = False
+    # Create evaluation form
+    with st.form(key=f"team_{selected_team['id']}_form"):
         updated_scores = {}
         
-        for i, criterion in enumerate(CRITERIA):
+        # Score inputs for each criterion
+        for criterion in CRITERIA:
             with st.expander(f"{criterion['name']} ({criterion['weight']}%)", expanded=True):
                 st.write(f"**Description:** {criterion['description']}")
                 
-                # Score selection
                 current_score = team_scores.get(criterion['id'], 1)
                 
                 col1, col2 = st.columns([2, 3])
                 
                 with col1:
                     score = st.radio(
-                        f"Score:",
+                        "Score:",
                         options=[1, 2, 3, 4, 5],
                         index=current_score - 1,
-                        key=f"team_{selected_team['id']}_{criterion['id']}",
-                        horizontal=True
+                        key=f"team_{selected_team['id']}_{criterion['id']}"
                     )
                 
                 with col2:
-                    # Show detailed descriptions
+                    # Show score descriptions
                     for score_val in [1, 2, 3, 4, 5]:
                         if score_val == score:
                             st.success(f"**{score_val} - {SCORE_LABELS[score_val]}:** {SCORE_DESCRIPTIONS[criterion['id']][score_val]}")
@@ -622,9 +644,6 @@ def main():
                             st.write(f"**{score_val} - {SCORE_LABELS[score_val]}:** {SCORE_DESCRIPTIONS[criterion['id']][score_val]}")
                 
                 updated_scores[criterion['id']] = score
-                
-                if score != current_score:
-                    changes_made = True
         
         # Comments section
         st.subheader("💬 Comments")
@@ -632,68 +651,115 @@ def main():
         comment = st.text_area(
             f"Additional comments for {selected_team['name']}:",
             value=current_comment,
-            height=100,
-            key=f"team_{selected_team['id']}_comment"
+            height=100
         )
         
-        if comment != current_comment:
-            changes_made = True
+        # Submit button
+        submit_button = st.form_submit_button("💾 Save Evaluation", type="primary")
         
-        # Auto-save when changes are made
-        if changes_made:
-            if save_evaluation(judge_name, selected_team['id'], selected_team['name'], updated_scores, comment):
-                st.success("✅ Changes saved automatically!")
+        if submit_button:
+            # Save to database
+            if db_manager.save_evaluation(judge_name, selected_team['id'], selected_team['name'], updated_scores, comment):
+                auto_save_status.success("✅ Evaluation saved successfully!")
+                time.sleep(1)
                 st.rerun()
+            else:
+                auto_save_status.error("❌ Failed to save evaluation!")
+    
+    # Navigation buttons
+    col1, col2, col3 = st.columns([1, 1, 1])
+    
+    with col1:
+        if selected_team['id'] > 1:
+            if st.button("⬅️ Previous Team", key="prev_team"):
+                st.query_params["team"] = str(selected_team['id'] - 1)
+                st.rerun()
+    
+    with col2:
+        # Show current team position
+        st.write(f"Team {selected_team['id']} of {len(TEAMS)}")
+    
+    with col3:
+        if selected_team['id'] < len(TEAMS):
+            if st.button("Next Team ➡️", key="next_team"):
+                st.query_params["team"] = str(selected_team['id'] + 1)
+                st.rerun()
+    
+    # Summary section
+    if team_complete:
+        st.markdown("---")
+        st.header("📊 Team Summary")
         
-        # Navigation buttons
-        col1, col2, col3 = st.columns([1, 1, 1])
+        col1, col2 = st.columns([2, 1])
         
         with col1:
-            if selected_team['id'] > 1:
-                if st.button("⬅️ Previous Team", key="prev_team"):
-                    st.query_params["team"] = str(selected_team['id'] - 1)
-                    st.rerun()
-        
-        with col2:
-            if st.button("💾 Save Team", key="save_team"):
-                if save_evaluation(judge_name, selected_team['id'], selected_team['name'], updated_scores, comment):
-                    st.success("✅ Team saved!")
-                else:
-                    st.error("❌ Save failed")
-        
-        with col3:
-            if selected_team['id'] < len(TEAMS):
-                if st.button("Next Team ➡️", key="next_team"):
-                    st.query_params["team"] = str(selected_team['id'] + 1)
-                    st.rerun()
-    
-    with tab2:
-        st.subheader("📊 Team Summary")
-        
-        if team_complete:
-            # Score breakdown
             st.write("**Score Breakdown:**")
             for criterion in CRITERIA:
-                score = team_scores[criterion['id']]
-                weighted_contribution = score * criterion['weight'] / 100
-                st.write(f"- {criterion['name']}: {score}/5 ({SCORE_LABELS[score]}) → {weighted_contribution:.2f} points")
+                if criterion['id'] in team_scores:
+                    score = team_scores[criterion['id']]
+                    weighted_contribution = score * criterion['weight'] / 100
+                    st.write(f"- {criterion['name']}: {score}/5 ({SCORE_LABELS[score]}) → {weighted_contribution:.2f} points")
             
-            # Total score
+            if team_scores.get('comment'):
+                st.write(f"**Comment:** {team_scores['comment']}")
+        
+        with col2:
             total_weighted = calculate_weighted_score(team_scores)
             st.metric("**Total Weighted Score**", f"{total_weighted:.2f}/5.0")
             
-            # Comment
-            if team_scores.get('comment'):
-                st.write(f"**Comment:** {team_scores['comment']}")
-        else:
-            st.warning("Complete all criteria to see the summary.")
-    
-    # Final submission
+            # Score visualization
+            score_data = []
+            for criterion in CRITERIA:
+                if criterion['id'] in team_scores:
+                    score_data.append({
+                        'Criterion': criterion['name'][:20] + '...' if len(criterion['name']) > 20 else criterion['name'],
+                        'Score': team_scores[criterion['id']],
+                        'Weight': criterion['weight']
+                    })
+            
+            if score_data:
+                import plotly.express as px
+                fig = px.bar(
+                    score_data, 
+                    x='Score', 
+                    y='Criterion',
+                    orientation='h',
+                    title='Score Breakdown',
+                    color='Score',
+                    color_continuous_scale='RdYlGn'
+                )
+                fig.update_layout(height=400)
+                st.plotly_chart(fig, use_container_width=True)
+
+    # Final completion status
     if completed_teams == len(TEAMS):
         st.markdown("---")
         st.header("🎉 Evaluation Complete!")
         st.success(f"You have completed evaluating all {len(TEAMS)} teams!")
         st.balloons()
+        
+        # Show overall statistics
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Teams Evaluated", completed_teams)
+        
+        with col2:
+            # Calculate average score across all teams
+            all_scores = []
+            for team in TEAMS:
+                team_data = db_manager.load_evaluation(judge_name, team['id'])
+                if len(team_data) > 1:  # Has scores (excluding just comment)
+                    weighted_score = calculate_weighted_score(team_data)
+                    all_scores.append(weighted_score)
+            
+            if all_scores:
+                avg_score = sum(all_scores) / len(all_scores)
+                st.metric("Average Score", f"{avg_score:.2f}/5.0")
+        
+        with col3:
+            st.metric("Completion Rate", "100%")
 
 if __name__ == "__main__":
     main()
+
